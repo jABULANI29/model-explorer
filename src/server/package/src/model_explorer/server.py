@@ -20,6 +20,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import webbrowser
 from importlib import metadata
@@ -28,7 +29,7 @@ from typing import Any, Union
 
 import portpicker
 import requests
-from flask import Flask, make_response, request, send_from_directory
+from flask import Flask, Response, make_response, request, send_from_directory
 from IPython import display
 from packaging.version import parse
 from termcolor import colored, cprint
@@ -37,7 +38,30 @@ from .config import ModelExplorerConfig
 from .consts import (DEFAULT_COLAB_HEIGHT, DEFAULT_HOST, DEFAULT_PORT,
                      PACKAGE_NAME)
 from .extension_manager import ExtensionManager
+from .server_director import ServerDirector
 from .utils import convert_adapter_response
+
+# The current directive to send to a running server.
+cur_server_directive = ''
+server_directive_generator_running = False
+
+# Lock to synchronize access to the command variable
+server_directive_lock = threading.Lock()
+
+
+def _event_stream_generator():
+  global cur_server_directive, server_directive_generator_running
+  print('call event stream generator')
+
+  while server_directive_generator_running:
+    with server_directive_lock:
+      if cur_server_directive:
+        print('!!!!', cur_server_directive)
+        yield f"data: {cur_server_directive}\n\n"
+        cur_server_directive = ""
+
+    yield ": heartbeat\n\n"
+    time.sleep(1)
 
 
 def _make_json_response(obj):
@@ -125,6 +149,13 @@ def start(
         won't be present if it is None.
     skip_health_check: Whether to skip the health check after server starts.
   """
+
+  # Don't start the server if user wants to reuse an existing server.
+  if config is not None and config.reuse_server_host != '' and config.reuse_server_port > 0:
+    director = ServerDirector(config=config)
+    director.start()
+    return
+
   # Check whether it is running in colab.
   colab = 'google.colab' in sys.modules or os.getenv('COLAB_RELEASE_TAG')
 
@@ -249,6 +280,46 @@ def start(
       return _make_json_response({'content': content})
     except Exception as err:
       return _make_json_response({'error': str(err)})
+
+  @app.route('/check_health')
+  def check_health():
+    """Serves check_health request."""
+    return 'model_explorer_ok'
+
+  @app.route('/apipost/v1/update_config', methods=['POST'])
+  def update_config():
+    global cur_server_directive
+
+    # TODO(do not submit): Update confnig.
+    config_data = request.json
+    if config and config_data:
+      config.set_transferrable_data(config_data)
+
+      # Ask UI to refresh page with the new url.
+      with server_directive_lock:
+        cur_server_directive = json.dumps(
+            {'name': 'refreshPage',
+             'url':  f'/?data={config.to_url_param_value()}'})
+        print('updating config')
+        print('-----------------------------------')
+    return ''
+
+  @app.route('/apistream/server_director')
+  def server_director_stream():
+    global server_directive_generator_running
+
+    if not server_directive_generator_running:
+      server_directive_generator_running = True
+      threading.Thread(target=_event_stream_generator).start()
+
+    headers = {
+        'Access-Control-Allow-Origin': '*'
+    }
+    return Response(
+        _event_stream_generator(),
+        headers=headers,
+        content_type="text/event-stream",
+        mimetype="text/event-stream")
 
   @app.route('/')
   def send_index_html():
